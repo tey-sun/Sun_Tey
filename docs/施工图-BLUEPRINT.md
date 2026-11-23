@@ -14,7 +14,7 @@
 ## 0. 一句话产品定义
 
 装完就能用的 Windows 下载器：**HTTP/HTTPS 多线程 + BT + 磁力 + 网页视频嗅探 + 下载后自动转 MP4**，
-零配置启动、浏览器自动接管、常用设置集中在一个页面，单个 exe 安装包装完即用。
+零配置启动、浏览器自动接管、**任意时刻断电重启都能精确续传**、常用设置集中在一个页面，单个 exe 安装包装完即用。
 
 ## 1. 需求 → 里程碑映射（可追踪）
 
@@ -29,6 +29,7 @@
 | R7 | 不要用户设置，装好即用 | M0 | 全新机器零配置完成一次下载与一次扩展接管 |
 | R8 | 设置里有下载工具常用设置 | M8 | 设置页覆盖目录/并发/限速/接管/后处理/代理等 |
 | R9 | 打包 exe，重装系统直接装 | M8 | 未装依赖的干净 VM 装完能下载 |
+| R11 | 断点续传（新增，横切多协议） | M1.5 | 强杀进程/重启系统后精确续传，字节级不重下不损坏 |
 | R10 | 开源到 GitHub | M0 起 | LICENSE/copyright/合规说明齐备 |
 
 
@@ -157,6 +158,54 @@ go test ./internal/download/httpx/ -run 'Dynamic|Steal|SlowStart' -count=1
 python scripts/bench_multithread.py --url <测试文件> --conns 1,8,16 --repeat 3
 ```
 判据：本地服务器下 8/16 路相对 1 路有可复现加速（记录 MB/s 表）；单连接回退路径有测试覆盖；`docs/验收报告/M1.md` 记录数据表。
+
+---
+
+### M1.5 — 断点续传与崩溃恢复硬化（R11，横切能力）
+
+**目标**：任何时刻进程被杀、断电、系统重启、网络中断，重新打开都能**接着下**，
+既不从头重来，也不产生损坏文件。这是所有协议共用的横切能力，不属任何一个协议模块。
+
+**输入事实**：前代实现已有 chunk 级快照 + 启动修复，且「断点续传/断网恢复」判为达标 `[S]`；
+但快照格式无版本号、跨版本兼容性未测（见 §8 风险表）`[U]`。
+
+**统一恢复模型（写入 §6 数据模型）**
+
+```
+Snapshot { version, taskId, proto, destPath, totalSize, fileIdentity, chunks[], updatedAt }
+fileIdentity = { size, lastModified, etag | 强校验哈希 }   // 服务端变了就不能续
+chunk        = { index, start, end, written, state: idle|active|done|poisoned }
+```
+
+**必须实现的 6 项**
+
+| # | 能力 | 要求 |
+|---|---|---|
+| 1 | 快照持久化 | 每 chunk 进度落盘；写入用「临时文件 + rename」原子替换，避免半截快照 |
+| 2 | 崩溃安全 | 支持 `SIGTERM`/窗口关闭/`taskkill /F`/断电四种场景；最坏丢失 ≤2 s 进度 |
+| 3 | 服务端一致性校验 | 续传前发 `HEAD`/`Range: bytes=0-0`，比对 size/ETag/Last-Modified；不一致→**判定不可续**并明确提示「源文件已变更，将重新下载」 |
+| 4 | 服务器不支持 Range | 探测到 `Accept-Ranges: none` 或 200 回全量 → 回退单连接整文件重下，并记住该结论（同 host 缓存） |
+| 5 | 协议级续传 | HTTP：Range 分片；BT/磁力：以 piece 为单位天然可续，只需持久化已校验 piece 位图 + 不删 `.part`；HLS/DASH：以**分片清单**为续传单位，记录已完成分片索引，重启后重取清单只补缺失分片（token 过期要重取清单再续） |
+| 6 | 文件布局稳定 | `.suntey-partial` 中间文件 → 完成后原子改名；重命名冲突自动加序号且**不覆盖**已有文件 |
+
+**禁止**：靠文件大小猜进度；快照与实际文件不一致时静默清零重下（必须提示并让用户选择）；
+把「已下载字节」当作可信来源而不做实际 `Stat` 校验。
+
+**验收（必须真跑，脚本落 `scripts/test_resume_matrix.py`）**
+
+```
+# 每种场景都要跑，并记录「重下字节数 / 最终文件哈希 / 是否与原文件一致」
+场景 A：下载中 kill /F 内核进程 → 重启 → 续传完成
+场景 B：下载中重启整台机器 → 自动恢复并续传完成
+场景 C：拔网线 30s → 恢复 → 从断点继续（不断任务）
+场景 D：中途改服务端文件（size/ETag 变）→ 判定不可续并明确提示
+场景 E：服务器 Accept-Ranges: none → 正确回退单连接
+场景 F：HLS 下载一半杀进程 → 重启 → 只补缺失分片
+场景 G：磁力下载一半重启 → piece 位图恢复，不重复校验已完成 piece
+```
+
+**判据**：A/B/C/E/F/G 六个场景**重下字节数 < 5%**（理想为 0）且最终 SHA-256 与完整下载一致；
+场景 D 必须拒绝续传并给出可操作提示；全部结果写 `docs/验收报告/M1.5.md`（表格：场景/重下字节/耗时/哈希一致性）。
 
 ---
 
@@ -362,6 +411,22 @@ Task: id, kind(http|torrent|magnet|playlist), name, url, savePath, status,
 
 规则：状态枚举一经发布只增不改；`status` 与 `post.status` 分离（下载成功 ≠ 后处理成功）。
 
+### 6.1 续传快照（R11 / M1.5 的落盘契约）
+
+```
+Snapshot { version, taskId, proto, destPath, totalSize, fileIdentity, chunks[], updatedAt }
+fileIdentity { size, lastModified, etag, strongHash }      // 任一项变了即判定「不可续」
+chunk { index, start, end, written, state: idle|active|done|poisoned }
+torrentResume { pieceBitmap, trackerState, announceAt }     // BT/磁力：piece 粒度
+playlistResume { manifestUrl, doneSegments[], variant }      // HLS/DASH：分片粒度
+```
+
+约束：
+1. `version` 必填，读旧版本快照必须走迁移函数，迁移失败则**保留原文件并提示**，禁止静默重下。
+2. 快照写入 = 写临时文件 + `rename` 原子替换；禁止就地截断重写。
+3. 「已下载字节」永远不作为可信来源，必须 `Stat` 实际文件后再采信。
+4. 中间文件后缀统一 `.suntey-partial`，完成后原子改名；**不覆盖**用户已有文件。
+
 ## 7. 测试策略（门禁不可放宽）
 
 | 层 | 内容 | 何时跑 |
@@ -369,6 +434,7 @@ Task: id, kind(http|torrent|magnet|playlist), name, url, savePath, status,
 | 单元 | `go test ./...`（含 httpx 动态分片、bttx 选文件、post 幂等） | 每次提交 |
 | 契约 | REST 路由 + 鉴权 + 错误体形状 | 每次提交 |
 | 集成 | 本地 HTTP 服务器 + 合成种子 + 合成 m3u8 | 每次提交 |
+| **续传矩阵** | M1.5 的 A–G 七场景（kill /F / 重启系统 / 断网 / 源变更 / 无 Range / HLS / 磁力） | 每次触及任一协议的提交 |
 | 端到端 | 扩展加载 + 真实站点三类 + 完成后转码 | 每个涉及扩展/后处理的里程碑 |
 | 装机 | 干净 VM 安装→下载→卸载 | M8 |
 
@@ -393,11 +459,12 @@ Task: id, kind(http|torrent|magnet|playlist), name, url, savePath, status,
 ## 10. 顺序与并行建议
 
 ```
-M0（阻塞）→ M1 ─┐
-                ├→ M4 → M5 → M8
-        M2 ─────┘              ↘
-        M3 ──────────────────→  发布
-        M6/M7 可在 M4 之后并行插入
+M0（阻塞，含绿色基线）
+   └→ M1  多线程          ─┐
+       M1.5 断点续传硬化   ─┤（M1.5 必须先于 M2：磁力/HLS 复用同一恢复契约）
+           M2  BT/磁力     ─┼→ M4 后处理 → M5 零配置/UI → M8 设置+安装包 → 发布
+           M3  扩展嗅探    ─┤
+           M6 去水印、M7 受限站点 ─┘（M4 之后并行插入）
 ```
 
 M1 与 M2 可并行（写集不相交：`httpx/` 与 `bttx/`）；M3（extension/）与 M4（internal/post/）可并行。
