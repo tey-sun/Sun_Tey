@@ -119,6 +119,7 @@ func TestProbeSizedReadUnderCap(t *testing.T) {
 // a download (what Manager.Stop does) cuts through them instead of waiting
 // every leg out (measured pre-fix: 5-8s to settle, probe saw worse).
 func TestStopInterruptsRateLimitedReads(t *testing.T) {
+	skipLong(t, "server throttles the body to ~1 KiB/s on purpose")
 	t.Cleanup(func() { SetRate(0); ResetRateBucket() })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "2097152")

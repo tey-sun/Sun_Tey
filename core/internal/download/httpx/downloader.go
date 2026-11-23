@@ -44,9 +44,20 @@ const (
 )
 
 // retryableErr marks a transient HTTP status (5xx/429/408) worth retrying.
-type retryableErr struct{ status int }
+// A Retry-After value (429/503) rides along, so the wait matches what the
+// server asked for instead of the generic exponential backoff - hammering a
+// throttling CDN with the old 8 s cap is how an IP gets temporarily banned.
+type retryableErr struct {
+	status int
+	delay  time.Duration
+}
 
-func (e *retryableErr) Error() string { return fmt.Sprintf("HTTP %d", e.status) }
+func (e *retryableErr) Error() string {
+	if e.delay > 0 {
+		return fmt.Sprintf("HTTP %d?????? %v ????", e.status, e.delay)
+	}
+	return fmt.Sprintf("HTTP %d", e.status)
+}
 
 // fatalErr marks an attempt error that must end the run with a clear,
 // actionable reason: retrying cannot help (dead link, changed content).
@@ -140,6 +151,24 @@ type Downloader struct {
 	StallGlobal        time.Duration // whole-run watchdog: zero progress this long => ErrStalled
 	SlowWindow         time.Duration // runRanges: window in which >= half legs at zero => OnSlow
 	FullRestartMax     int           // sequential: max "200 ignores Range" full restarts per run (anti-loop)
+
+	// --- M1 (R1): IDM/aria2-style dynamic connection budget ---------------
+	// Three INDEPENDENT knobs, mirroring aria2 --min-split-size / -x / -s, so a
+	// 2 MB file is not chopped into 16 fragments while a 20 GB file stays one
+	// stream. Zero values fall back to the defaults in dynamic.go.
+	MinSplitSize      int64         // never split below 2x this; segments >= this
+	SegmentFloor      int64         // smallest segment once a split is justified
+	MaxConnPerHost    int           // simultaneous connections to ONE server
+	MaxConns          int           // simultaneous connections across ALL tasks
+	SegmentsPerLeg    int           // work units per connection on average
+	MaxSegments       int           // snapshot-size bound
+	StealThreshold    time.Duration // victim must be idle this long to be stolen
+	StealMinChunkSize int64         // never hand over a remainder below this
+	StealMaxPerChunk  int           // steal ping-pong guard per segment
+	ThrottleCooldown  time.Duration // 429/503 freeze window for new connections
+
+	slots     *connPool // MaxConns budget, shared by every task of this core
+	slotsOnce sync.Once
 }
 
 func NewDownloader(c *http.Client, ua string) *Downloader {
@@ -162,6 +191,16 @@ func NewDownloader(c *http.Client, ua string) *Downloader {
 		StallGlobal:         StallGlobalDefault,
 		SlowWindow:          SlowWindowDefault,
 		FullRestartMax:      FullRestartMaxDefault,
+		MinSplitSize:        MinSplitSizeDefault,
+		SegmentFloor:        SegmentFloorDefault,
+		MaxConnPerHost:      MaxConnPerHostDefault,
+		MaxConns:            MaxConnsDefault,
+		SegmentsPerLeg:      SegmentsPerLegDefault,
+		MaxSegments:         MaxSegmentsDefault,
+		StealThreshold:      StealThresholdDefault,
+		StealMinChunkSize:   StealMinChunkDefault,
+		StealMaxPerChunk:    StealMaxPerChunkDefault,
+		ThrottleCooldown:    ThrottleCooldownDefault,
 	}
 }
 
@@ -204,8 +243,11 @@ type RunOptions struct {
 	// per-chunk completed bytes. It is called every PersistEvery WHILE the
 	// download runs, so a hard kill/crash loses at most one interval — the
 	// fix for "resume restarts from zero after the app was killed".
-	// chunkDone is nil for sequential runs.
-	Persist func(total int64, chunkDone []int64)
+	// chunks is the WHOLE segment layout with the completed bytes per
+	// segment (the plan changes with the connection count, so the manager
+	// must store layout and progress together or a resume re-fetches what
+	// is already on disk). nil for sequential runs.
+	Persist func(total int64, chunks []model.ChunkState)
 	// OnStall fires once when the run-level watchdog sees zero progress for
 	// StallGlobal (elapsed seconds). The run then settles with an error
 	// wrapping ErrStalled ("服务器连接不稳定/已断开"); the manager should mark
@@ -224,9 +266,9 @@ func (o *RunOptions) emit(e model.Event) {
 	}
 }
 
-func (o *RunOptions) persistSnapshot(total int64, done []int64) {
+func (o *RunOptions) persistSnapshot(total int64, chunks []model.ChunkState) {
 	if o != nil && o.Persist != nil {
-		o.Persist(total, done)
+		o.Persist(total, chunks)
 	}
 }
 
@@ -340,214 +382,6 @@ func (d *Downloader) persistTicks() int {
 	return n
 }
 
-func (d *Downloader) runRanges(ctx context.Context, task *model.Task, f *os.File, opts *RunOptions) error {
-	d.ensureChunks(task)
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Per-chunk atomic counters: workers own their chunk, but the progress
-	// reporter and the mid-run persistence snapshot read them race-free.
-	n := len(task.Chunks)
-	done := make([]*atomic.Int64, n)
-	var sum int64
-	for i := range task.Chunks {
-		done[i] = &atomic.Int64{}
-		done[i].Store(task.Chunks[i].Downloaded)
-		sum += task.Chunks[i].Downloaded
-	}
-	var total atomic.Int64
-	total.Store(sum)
-
-	// Leave the task with consistent progress on EVERY return path — pause,
-	// error, watchdog, completion. Without this, a cancelled run left
-	// task.Downloaded at its pre-run value (the per-chunk snapshots were
-	// written, the total was not), so callers that read task.Downloaded (CLI
-	// resume, tests, the manager's fallback) saw 0 and re-downloaded from
-	// scratch.
-	defer func() {
-		var s int64
-		for i := range task.Chunks {
-			if i < len(done) {
-				task.Chunks[i].Downloaded = done[i].Load()
-			}
-			s += task.Chunks[i].Downloaded
-		}
-		task.Downloaded = s
-	}()
-
-	wd := newWatchdog(d.StallGlobal)
-	defer wd.halt()
-	wd.start(ctx, cancel, &total, opts, task.ID)
-
-	startTS := time.Now()
-	stop := make(chan struct{})
-	rDone := make(chan struct{})
-	defer func() { close(stop); <-rDone }() // no persist call races the final save
-
-	// Low-progress protection: per-leg progress watermarks. If, after
-	// SlowWindow, >= half of the unfinished legs gained zero bytes, the CDN
-	// is throttling per-connection — fire opts.OnSlow once (degradation
-	// signal for the manager: reduce connections / downgrade to sequential).
-	baseDone := make([]int64, n)
-	for i := range done {
-		baseDone[i] = done[i].Load()
-	}
-	var slowFired atomic.Bool
-	checkSlow := func() {
-		if slowFired.Load() || time.Since(startTS) < d.SlowWindow {
-			return
-		}
-		var stalled int
-		active := 0
-		var idx []int
-		for i := range done {
-			chunkLen := task.Chunks[i].End - task.Chunks[i].Start + 1
-			if baseDone[i] >= chunkLen {
-				continue // leg already complete before the window
-			}
-			active++
-			if done[i].Load() == baseDone[i] {
-				stalled++
-				idx = append(idx, task.Chunks[i].Index)
-			}
-		}
-		if active > 0 && stalled*2 >= active && slowFired.Swap(true) == false {
-			opts.slow(idx)
-			opts.emit(model.Event{Type: "slow", TaskID: task.ID, Status: "running",
-				Downloaded: total.Load(),
-				Err:        fmt.Sprintf("低进度信号：%d/%d 条连接在 %v 内零进展（腿 %v），服务器按连接限速", stalled, active, d.SlowWindow, idx),
-				TS:         time.Now().UnixMilli()})
-		}
-	}
-
-	pticks := d.persistTicks()
-	lastDN := total.Load()
-	lastTS := time.Now()
-	go func() {
-		defer close(rDone)
-		t := time.NewTicker(500 * time.Millisecond)
-		defer t.Stop()
-		ticks := 0
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				dn := total.Load()
-				now := time.Now()
-				// Instant speed over the reporting interval (the sequential path
-				// already does this). dn/elapsed is a cumulative average: after a
-				// resume it stays pinned at the old slow value for minutes, and a
-				// resumed task showed "0 B/s" while bytes were flying — users read
-				// that as "卡在 0 B/s 不动了".
-				var speed float64
-				if dt := now.Sub(lastTS).Seconds(); dt > 0 {
-					speed = float64(dn-lastDN) / dt
-				}
-				lastDN, lastTS = dn, now
-				opts.emit(model.Event{Type: "progress", TaskID: task.ID, Downloaded: dn, Size: task.Size, Speed: speed, TS: now.UnixMilli()})
-				checkSlow()
-				ticks++
-				if ticks >= pticks {
-					ticks = 0
-					snap := make([]int64, n)
-					for i := range done {
-						snap[i] = done[i].Load()
-					}
-					opts.persistSnapshot(dn, snap)
-				}
-			}
-		}
-	}()
-
-	g := sync.WaitGroup{}
-	errCh := make(chan error, n)
-	rangeOK := &atomic.Bool{}
-	rangeOK.Store(true)
-	for i := range task.Chunks {
-		g.Add(1)
-		go func(ci int) {
-			defer g.Done()
-			err := d.downloadChunk(ctx, task, f, &task.Chunks[ci], done[ci], &total, rangeOK, cancel, opts, wd)
-			// Keep resume state on every exit path (incl. cancel of a sibling).
-			task.Chunks[ci].Downloaded = done[ci].Load()
-			if err != nil && !errors.Is(err, context.Canceled) {
-				cancel() // one chunk exhausted: stop the run, keep partials
-				errCh <- fmt.Errorf("chunk %d: %w", task.Chunks[ci].Index, err)
-			}
-		}(i)
-	}
-	g.Wait()
-	close(errCh)
-	if !rangeOK.Load() { // server ignored/misaligned Range in production
-		return ErrServerNotRange
-	}
-	if wd.fired.Load() { // global watchdog: 60s zero progress => dead link
-		return fmt.Errorf("服务器连接不稳定/已断开：整任务 %v 内零进展（停滞检测）: %w", d.StallGlobal, ErrStalled)
-	}
-	if err := <-errCh; err != nil { // first error (nil if all ok)
-		return err
-	}
-	// A run cancelled from OUTSIDE (user pause, app shutdown) must surface the
-	// cancellation, not "incomplete: x/y": workers swallow context.Canceled on
-	// purpose (a pause is not an error), which left the run reporting a bogus
-	// "not fully downloaded" failure — shown as a red 出错 task right after the
-	// user pressed 暂停, and it made the CLI print a failure + "retry?" prompt
-	// for a clean pause. Checked last: a Range lie (self-cancel) and the
-	// watchdog both keep their more specific reasons.
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	// Verify completeness.
-	dn := total.Load()
-	if task.Size >= 0 && dn < task.Size {
-		return fmt.Errorf("incomplete: %d/%d", dn, task.Size)
-	}
-	return nil
-}
-
-// ensureChunks splits the file into conn ranges, preserving any prior progress.
-func (d *Downloader) ensureChunks(task *model.Task) {
-	n := task.Conn
-	if n < 1 {
-		n = 1
-	}
-	if len(task.Chunks) == n {
-		return
-	}
-	size := task.Size
-	maxByConn := size / int64(n)
-	if maxByConn < minChunk {
-		n = int(size / minChunk)
-		if n < 1 {
-			n = 1
-		}
-	}
-	chunks := make([]model.ChunkState, 0, n)
-	var pos int64
-	for i := 0; i < n; i++ {
-		start := pos
-		end := pos + maxByConn - 1
-		if i == n-1 || end > size-1 {
-			end = size - 1
-		}
-		if start > end {
-			break
-		}
-		chunks = append(chunks, model.ChunkState{Index: i, Start: start, End: end})
-		pos = end + 1
-	}
-	preservePrior(chunks, task.Chunks)
-	task.Chunks = chunks
-	var sum int64
-	for _, c := range chunks {
-		sum += c.Downloaded
-	}
-	task.Downloaded = sum
-}
-
 // preservePrior maps verified byte intervals from an old chunk layout onto a new
 // one, so changing 连接数 in Settings no longer throws resume progress away. The
 // old code rebuilt every chunk with Downloaded = 0: the bytes on disk stayed
@@ -603,13 +437,19 @@ func preservePrior(chunks, old []model.ChunkState) {
 //
 // On a 200 full body (or misaligned 206) for a partial Range it flips rangeOK,
 // cancels the run and returns ErrServerNotRange so the manager can downgrade.
-func (d *Downloader) downloadChunk(ctx context.Context, task *model.Task, f *os.File, c *model.ChunkState, done *atomic.Int64, total *atomic.Int64, rangeOK *atomic.Bool, cancelAll context.CancelFunc, opts *RunOptions, wd *watchdog) error {
+func (d *Downloader) downloadChunk(ctx context.Context, rc *runCtx, idx int) error {
+	task, opts, wd := rc.task, rc.opts, rc.wd
+	done := rc.done[idx]
+	c := rc.chunk(idx) // fixed for the whole run (see runCtx)
 	chunkLen := c.End - c.Start + 1
 	attempts, failStreak, lowStreak, stallStreak := 0, 0, 0, 0
 	var stallProgress int64
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if rc.stealRequested(idx) {
+			return errStolen // a faster connection took this segment over
 		}
 		if done.Load() >= chunkLen {
 			return nil
@@ -621,8 +461,11 @@ func (d *Downloader) downloadChunk(ctx context.Context, task *model.Task, f *os.
 		before := done.Load()
 		offset := c.Start + before
 		attemptStart := time.Now()
-		aerr, idle := d.fetchAttempt(ctx, task, f, c, offset, done, total, rangeOK, cancelAll, wd)
+		aerr, idle := d.fetchAttempt(ctx, rc, idx, c, offset)
 		attemptDur := time.Since(attemptStart)
+		if rc.stealRequested(idx) {
+			return errStolen // the steal pass cut this attempt: hand the tail over
+		}
 		if aerr != nil {
 			if errors.Is(aerr, ErrServerNotRange) {
 				return aerr
@@ -674,6 +517,15 @@ func (d *Downloader) downloadChunk(ctx context.Context, task *model.Task, f *os.
 			lowStreak = 0
 		}
 		delay := d.nextDelay(failStreak)
+		var re *retryableErr
+		if errors.As(aerr, &re) && re.delay > 0 {
+			// The server named the wait: honour it (capped) instead of the generic
+			// backoff, otherwise a 429 turns into a permanent ban.
+			delay = re.delay
+			if cap := d.RetryMax * 8; delay > cap {
+				delay = cap
+			}
+		}
 		level := "info"
 		if failStreak >= 2 {
 			level = "warn"
@@ -694,8 +546,27 @@ func (d *Downloader) downloadChunk(ctx context.Context, task *model.Task, f *os.
 // watchdog cut the stream (dead-link signal for the caller's stall streak);
 // (err, false) for other classified errors (retryable transient, fatal,
 // ErrServerNotRange).
-func (d *Downloader) fetchAttempt(ctx context.Context, task *model.Task, f *os.File, c *model.ChunkState, offset int64, done, total *atomic.Int64, rangeOK *atomic.Bool, cancelAll context.CancelFunc, wd *watchdog) (error, bool) {
-	guard := newIdleGuard(ctx, d.IdleTimeout)
+func (d *Downloader) fetchAttempt(ctx context.Context, rc *runCtx, idx int, c model.ChunkState, offset int64) (error, bool) {
+	task, f, done, total := rc.task, rc.f, rc.done[idx], &rc.total
+	rangeOK, cancelAll, wd := &rc.rangeOK, rc.cancel, rc.wd
+
+	// Process-wide connection budget: a leg waits here (fair FIFO) instead of
+	// letting one task open every socket on the machine (MaxConns).
+	release, gerr := d.pool().acquire(ctx)
+	if gerr != nil {
+		return gerr, false
+	}
+	defer release()
+
+	// Attempt-scoped cancel: the steal pass cuts exactly this request and
+	// nothing else, so the segment can move to an idle leg without touching the
+	// run context or the other legs.
+	actx, acancel := context.WithCancel(ctx)
+	defer acancel()
+	unregister := rc.registerAttempt(idx, acancel)
+	defer unregister()
+
+	guard := newIdleGuard(actx, d.IdleTimeout)
 	defer guard.stop()
 
 	req, err := http.NewRequestWithContext(guard.ctx, http.MethodGet, task.Req.URL, nil)
@@ -708,8 +579,12 @@ func (d *Downloader) fetchAttempt(ctx context.Context, task *model.Task, f *os.F
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, c.End))
 
+	// Slow start: this attempt is one connection of the current wave; the
+	// response decides whether the next batch may open (see slowStart).
+	rc.ss.opened()
 	resp, err := d.Client.Do(req)
 	if err != nil {
+		rc.ss.failed()
 		if ctx.Err() != nil {
 			return ctx.Err(), false
 		}
@@ -718,6 +593,7 @@ func (d *Downloader) fetchAttempt(ctx context.Context, task *model.Task, f *os.F
 		}
 		return fmt.Errorf("request: %w", err), false
 	}
+	rc.ss.confirmed() // wave resolved: slow start may grow
 	defer resp.Body.Close()
 
 	fullFileChunk := c.Start == 0 && c.End == task.Size-1
@@ -730,9 +606,18 @@ func (d *Downloader) fetchAttempt(ctx context.Context, task *model.Task, f *os.F
 		cancelAll()
 		return ErrServerNotRange, false
 	}
+	// 429/503 is a different animal from a dead link: the resource is fine, the
+	// server is protecting itself. Freeze connection growth (gopeed does the
+	// same with paused=true), wait the requested time, and never treat it as
+	// "the link is dead" nor as a reason to open MORE connections.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		rc.ss.throttled(d.ThrottleCooldown)
+		return &retryableErr{status: resp.StatusCode, delay: retryAfter(resp.Header.Get("Retry-After"))}, false
+	}
+
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		if retryableStatus(resp.StatusCode) {
-			return &retryableErr{resp.StatusCode}, false
+			return &retryableErr{status: resp.StatusCode}, false
 		}
 		return &fatalErr{fmt.Sprintf("HTTP %d：链接无效或被拒绝（多半是直链已过期）。从浏览器扩展重新发送下载（自动刷新 Cookie/Referer），再点「开始」断点续传", resp.StatusCode)}, false
 	}
@@ -752,7 +637,8 @@ func (d *Downloader) fetchAttempt(ctx context.Context, task *model.Task, f *os.F
 	// Never write beyond this chunk's boundary, whatever the body claims.
 	remain := c.End - offset + 1
 	bw := &countingReader{r: io.LimitReader(resp.Body, remain)}
-	if _, serr := d.stream(guard.ctx, f, offset, bw, done, total, func(n int64) { guard.add(n); wd.add(n) }); serr != nil {
+	if _, serr := d.stream(guard.ctx, f, offset, bw, done, total,
+		func(n int64) { guard.add(n); wd.add(n); rc.touch(idx) }); serr != nil {
 		if ctx.Err() != nil {
 			return ctx.Err(), false
 		}
@@ -956,6 +842,12 @@ func (d *Downloader) runSequential(ctx context.Context, task *model.Task, f *os.
 // seqAttempt performs one sequential GET (resuming at base0 when > 0),
 // streaming from the verified body offset into f.
 func (d *Downloader) seqAttempt(ctx context.Context, task *model.Task, f *os.File, base0 int64, chunkLocal, total *atomic.Int64) error {
+	release, gerr := d.pool().acquire(ctx)
+	if gerr != nil {
+		return gerr
+	}
+	defer release()
+
 	guard := newIdleGuard(ctx, d.IdleTimeout)
 	defer guard.stop()
 
@@ -984,7 +876,7 @@ func (d *Downloader) seqAttempt(ctx context.Context, task *model.Task, f *os.Fil
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		if retryableStatus(resp.StatusCode) {
-			return &retryableErr{resp.StatusCode}
+			return &retryableErr{status: resp.StatusCode, delay: retryAfter(resp.Header.Get("Retry-After"))}
 		}
 		return &fatalErr{fmt.Sprintf("HTTP %d：链接无效或被拒绝（多半是直链已过期）。从浏览器扩展重新发送下载（自动刷新 Cookie/Referer），再点「开始」断点续传", resp.StatusCode)}
 	}
@@ -1120,4 +1012,48 @@ func parseContentRange(v string) (start, end, total int64, ok bool) {
 		end = e
 	}
 	return start, end, total, ok
+}
+
+// pool returns the shared connection budget. sync.Once keeps hand-built
+// Downloaders (tests) working without a constructor guarantee.
+func (d *Downloader) pool() *connPool {
+	d.slotsOnce.Do(func() {
+		n := d.MaxConns
+		if n < 1 {
+			n = MaxConnsDefault
+		}
+		d.slots = newConnPool(n)
+	})
+	return d.slots
+}
+
+// SetMaxConns re-sizes the whole-process connection budget (settings page).
+func (d *Downloader) SetMaxConns(n int) {
+	if n < 1 {
+		n = 1
+	}
+	d.MaxConns = n
+	d.pool().setMax(n)
+}
+
+// retryAfter parses a Retry-After header: delta-seconds or an HTTP date.
+// Junk or a past date means "no instruction" (0), which falls back to the
+// normal backoff; a bogus huge value is capped by the caller.
+func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

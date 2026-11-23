@@ -56,6 +56,10 @@ func TestAutoDowngradeEndToEnd(t *testing.T) {
 
 	cfg := model.Config{DownloadDir: dir, DefaultConn: 4}
 	m := NewManager(st, event.NewBus(), cfg)
+	// M1 only splits files >= 2x min-split-size (4 MiB by default, aria2 rule).
+	// Shrink it so this 300 KiB fixture really is a multi-segment plan and the
+	// lying server is really caught.
+	m.dl.MinSplitSize, m.dl.SegmentFloor = 64<<10, 64<<10
 
 	task, err := m.Create(t.Context(), model.Request{URL: ts.URL + "/f.bin"})
 	if err != nil {

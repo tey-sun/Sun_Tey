@@ -118,6 +118,7 @@ func dripAtServer(data []byte, perConn int64, delay time.Duration) *httptest.Ser
 // whole file is perfectly downloadable — it just needs more connections, which
 // is exactly what resume does. Bounded work, no give-up.
 func TestChurnSmallDropsComplete(t *testing.T) {
+	skipLong(t, "server drops small ranges; the retry budget needs real time")
 	const size = 1 << 20 // 1 MiB
 	data := bytes.Repeat([]byte("C"), size)
 	srv := dropAtServer(data, 4<<10)
@@ -125,6 +126,7 @@ func TestChurnSmallDropsComplete(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "churn.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	d.RetryBase = time.Millisecond
 	d.RetryMax = 4 * time.Millisecond
 
@@ -162,6 +164,7 @@ func TestFlakyDropsResumeToCompletion(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "flaky.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	d.RetryBase = time.Millisecond
 	d.RetryMax = 4 * time.Millisecond
 
@@ -191,6 +194,7 @@ func TestFlakyDropsResumeToCompletion(t *testing.T) {
 // hours-long silent spin the old code did. Partial progress must survive so a
 // later resume against a healthy server completes byte-exact.
 func TestThrottleGivesUpBounded(t *testing.T) {
+	skipLong(t, "bounded give-up walks the whole backoff ladder")
 	const size = 1 << 20 // 1 MiB
 	data := bytes.Repeat([]byte("T"), size)
 	// 4 KiB per connection AND 800 ms per 1 KiB written: ~1.2 KiB/s effective.
@@ -203,6 +207,7 @@ func TestThrottleGivesUpBounded(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "thr.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	d.RetryBase = time.Millisecond
 	d.RetryMax = 2 * time.Millisecond
 	d.LowStreakLimit = 3
@@ -278,6 +283,7 @@ func TestChunkedFullBody200Downgrade(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "chunked200.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	task := &model.Task{ID: "ch1", Req: model.Request{URL: srv.URL + "/c.bin"}, Size: size,
 		SupportRange: true, Conn: 4, SavePath: save}
 
@@ -316,6 +322,7 @@ func TestChunkedFullBody200Downgrade(t *testing.T) {
 // TestIdleStallWatchdog: "206 headers then silence" must NOT hang forever —
 // the idle watchdog aborts each attempt and the run settles with an error.
 func TestIdleStallWatchdog(t *testing.T) {
+	skipLong(t, "idle guard + run watchdog are wall-clock timeouts")
 	const size = 1 << 20
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, e, has := testRangeOf(r.Header.Get("Range"))
@@ -336,6 +343,7 @@ func TestIdleStallWatchdog(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "stall.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	d.IdleTimeout = 800 * time.Millisecond
 	d.LowStreakLimit = 2
 	d.MinUseful = 1 << 20
@@ -372,6 +380,7 @@ func TestPersistDuringRun(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "persist.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	d.PersistEvery = 500 * time.Millisecond
 
 	var mu sync.Mutex
@@ -379,11 +388,11 @@ func TestPersistDuringRun(t *testing.T) {
 	var chunkLens []int
 	opts := &RunOptions{
 		Emit: func(model.Event) {},
-		Persist: func(total int64, chunkDone []int64) {
+		Persist: func(total int64, chunks []model.ChunkState) {
 			mu.Lock()
 			defer mu.Unlock()
 			totals = append(totals, total)
-			chunkLens = append(chunkLens, len(chunkDone))
+			chunkLens = append(chunkLens, len(chunks))
 		},
 	}
 	task := &model.Task{ID: "p1", Req: model.Request{URL: srv.URL + "/p.bin"}, Size: size,

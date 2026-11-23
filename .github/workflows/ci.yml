@@ -60,5 +60,9 @@ jobs:
         run: go vet ./...
       - name: go test -short
         run: go test -short ./... -count=1 -timeout 30m
+      # 施工图 §7：长用例（真实计时器：idle 看门狗、退避上限、限速读取、小断流）
+      # 被 -short 跳过，但仍要每次推送都跑一遍——放在目标平台 Windows 上，非 race。
+      - name: go test (full, incl. long)
+        run: go test ./... -count=1 -timeout 40m
       - name: go build
         run: go build ./...

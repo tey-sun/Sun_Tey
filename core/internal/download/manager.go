@@ -552,16 +552,20 @@ func (m *Manager) run(ctx context.Context, id string, cancel context.CancelFunc,
 			// Persist progress mid-run (atomic chunk counters, ~every 2s): a hard
 			// kill or crash now loses at most one interval instead of everything —
 			// this is what makes resume survive process death.
-			Persist: func(total int64, chunkDone []int64) {
+			Persist: func(total int64, chunks []model.ChunkState) {
 				t2, err := m.Store.GetTask(id)
 				if err != nil || t2.Status != model.StatusRunning {
 					return
 				}
-				if len(chunkDone) > 0 && len(chunkDone) == len(t2.Chunks) {
+				// The planner owns the layout (it may re-split on a connection-count
+				// change while keeping every verified byte), so the snapshot stores the
+				// LIVE layout, not just counters: what is on disk must always be
+				// describable by the persisted chunk list (R11).
+				if len(chunks) > 0 {
+					t2.Chunks = chunks
 					var s int64
-					for i := range t2.Chunks {
-						t2.Chunks[i].Downloaded = chunkDone[i]
-						s += chunkDone[i]
+					for _, c := range chunks {
+						s += c.Downloaded
 					}
 					t2.Downloaded = s
 				} else {

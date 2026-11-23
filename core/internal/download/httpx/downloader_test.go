@@ -71,6 +71,7 @@ func TestResumeByteExact(t *testing.T) {
 	save := filepath.Join(dir, "f.bin")
 
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 
 	task := &model.Task{
 		ID:           "t1",
@@ -142,6 +143,7 @@ func TestSequentialIntegrity(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "seq.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	task := &model.Task{ID: "s1", Req: model.Request{URL: srv.URL}, Size: size, SupportRange: false, Conn: 1, SavePath: save}
 	if err := d.Run(context.Background(), task, quiet()); err != nil {
 		t.Fatal(err)
@@ -193,6 +195,7 @@ func TestServerIgnoresRangeNoDuplication(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "lie.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 	task := &model.Task{ID: "l1", Req: model.Request{URL: srv.URL}, Size: size, SupportRange: true, Conn: 4, SavePath: save}
 
 	err = d.Run(context.Background(), task, quiet())

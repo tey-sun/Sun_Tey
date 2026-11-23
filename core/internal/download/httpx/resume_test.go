@@ -46,8 +46,9 @@ func healthyRangeServer(data []byte) *httptest.Server {
 // and may only claim the CONTIGUOUS prefix of each new range.
 func TestEnsureChunksPreservesProgress(t *testing.T) {
 	d := NewDownloader(nil, "ua")
+	smallSplits(d)
 	task := &model.Task{ID: "rp", Size: 1000 << 10, Conn: 4, SavePath: filepath.Join(t.TempDir(), "rp.bin")}
-	d.ensureChunks(task)
+	d.planSegments(task)
 	if len(task.Chunks) != 4 {
 		t.Fatalf("want 4 chunks, got %d", len(task.Chunks))
 	}
@@ -57,7 +58,7 @@ func TestEnsureChunksPreservesProgress(t *testing.T) {
 	task.Chunks[3].Downloaded = 50 << 10
 
 	task.Conn = 2 // user changed 线程数 in Settings, then pressed 开始
-	d.ensureChunks(task)
+	d.planSegments(task)
 	if len(task.Chunks) != 2 {
 		t.Fatalf("want 2 chunks, got %d", len(task.Chunks))
 	}
@@ -90,6 +91,7 @@ func TestResumeAfterConnChange(t *testing.T) {
 
 	save := filepath.Join(t.TempDir(), "cc.bin")
 	d := NewDownloader(srv.Client(), "suntey-test")
+	smallSplits(d)
 
 	task := &model.Task{ID: "cc1", Req: model.Request{URL: srv.URL + "/cc.bin"}, Size: size,
 		SupportRange: true, Conn: 8, SavePath: save}
@@ -112,7 +114,7 @@ func TestResumeAfterConnChange(t *testing.T) {
 
 	// Change connections (Settings -> 线程数) and resume against a healthy server.
 	task.Conn = 2
-	d.ensureChunks(task)
+	d.planSegments(task)
 	if task.Downloaded <= 0 {
 		t.Fatalf("resume progress lost after conn change: %d", task.Downloaded)
 	}
