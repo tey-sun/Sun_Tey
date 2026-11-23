@@ -4,3 +4,6 @@ e2e-graceful.db
 probe_*.py
 !probe_rs10.py
 !probe_stop3.py
+
+# Python 缓存（跑测试脚本产生）
+__pycache__/

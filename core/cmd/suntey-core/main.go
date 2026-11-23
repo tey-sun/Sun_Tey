@@ -410,13 +410,28 @@ func cmdServe(args []string) {
 				dirty = true
 			}
 			if ts[i].Status == model.StatusRunning {
+				// 上一进程被强杀/断电/重启系统留下的「下载中」：落到暂停并标成崩溃，
+				// 这样下面的 AutoResume 才知道该捞它（M1.5 场景 B）。
 				ts[i].Status = model.StatusPaused
+				ts[i].PauseReason = model.PauseCrash
 				ts[i].UpdatedAt = time.Now()
 				dirty = true
 			}
 			if dirty {
 				_ = a.st.PutTask(ts[i])
 			}
+		}
+	}
+
+	// 快照迁移说明（M1.5）：旧版本任务库被提升时，逐条告诉用户改了什么。
+	for _, mg := range a.st.Migrations() {
+		emit(map[string]any{"type": "migration", "taskId": mg.TaskID, "name": mg.Name, "note": mg.Note})
+	}
+
+	// M1.5 场景 B：重启系统 / 进程被强杀后自动接着下（用户手动暂停的绝不自动开跑）。
+	if a.cfg.AutoResumeEnabled() {
+		if n := a.mgr.AutoResume(context.Background()); n > 0 {
+			emit(map[string]any{"type": "resumed", "count": n})
 		}
 	}
 

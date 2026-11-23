@@ -152,8 +152,12 @@ func TestGracefulShutdownPersistsProgress(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	resumed := served.Load() - servedBefore
-	if limit := int64(len(payload)) - paused + 4096; resumed > limit {
-		t.Fatalf("resume served %d bytes, limit %d (re-downloaded finished data)", resumed, limit)
+	// 预算 = 剩余字节 + 续传前的固定校验开销（探测 1 字节 + 有界头部窗口）+ 余量。
+	// 校验窗口是 M1.5 的**有意**开销（证明服务器文件没被换掉），不是重下已完成数据；
+	// 把它算进预算，才能真正守住「绝不重复下载已完成字节」这条判据。
+	budget := int64(len(payload)) - paused + model.HeadVerifyBytes + 4096
+	if resumed > budget {
+		t.Fatalf("resume served %d bytes, budget %d (re-downloaded finished data)", resumed, budget)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "g.bin"))
 	if err != nil {

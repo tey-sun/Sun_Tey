@@ -67,8 +67,11 @@ type ResolveResult struct {
 	// IsPage: the URL is an HTML page, not a file (small text/html body).
 	// The M6 resolver parses <a>/<source> links and resolves the best one;
 	// ProbedURL then records the real file link that was chosen.
-	IsPage    bool   `json:"isPage,omitempty"`
-	ProbedURL string `json:"probedUrl,omitempty"`
+	IsPage bool `json:"isPage,omitempty"`
+	// LastModified / ETag：源文件身份弱信号（R11 续传前校验用），缺失就是空串。
+	LastModified string `json:"lastModified,omitempty"`
+	ETag         string `json:"etag,omitempty"`
+	ProbedURL    string `json:"probedUrl,omitempty"`
 	// Candidates: every probed page link (M6.5) — the core already picked the
 	// best one; the UI may offer the user a picker and re-create with another.
 	Candidates []Candidate `json:"candidates,omitempty"`
@@ -119,8 +122,18 @@ type Task struct {
 	Downloaded   int64        `json:"downloaded"`
 	Speed        float64      `json:"speed"` // bytes/sec, rolling
 	Chunks       []ChunkState `json:"chunks"`
-	HLS          *HLSState    `json:"hls,omitempty"`
-	Err          string       `json:"err,omitempty"`
+	// SnapVersion 是续传快照的 schema 版本（0 = M1.5 之前的旧快照，读入即走迁移）。
+	SnapVersion int `json:"snapVersion,omitempty"`
+	// Identity 是源文件身份指纹：size / Last-Modified / ETag / 头部哈希，任一项变了即判定不可续。
+	Identity *FileIdentity `json:"identity,omitempty"`
+	// ResumeNote 是给人看的续传说明：为什么不能续传、迁移时放弃了多少进度。
+	ResumeNote string `json:"resumeNote,omitempty"`
+	// PauseReason 区分「用户点的暂停」与「系统停的」（关机/崩溃/降级）：前者永不自动续传。
+	PauseReason PauseReason `json:"pauseReason,omitempty"`
+	// TempPath 是下载中的中间文件路径（= SavePath + PartialSuffix）；完成后原子改名。
+	TempPath string    `json:"tempPath,omitempty"`
+	HLS      *HLSState `json:"hls,omitempty"`
+	Err      string    `json:"err,omitempty"`
 	// ProbedURL: when a pasted webpage was resolved to a direct file link,
 	// this records which link was chosen (Req.URL already points at it;
 	// restarts re-probe the file, never re-parse the page).
@@ -178,9 +191,17 @@ type Config struct {
 	BTNoUpload  *bool    `json:"btNoUpload,omitempty"`  // pure downloader mode
 	BTTrackers  []string `json:"btTrackers,omitempty"`  // extra trackers for every task
 	BTPeers     []string `json:"btPeers,omitempty"`     // pinned "host:port" peers
+	// AutoResumeOnLaunch: 启动时自动接着下「不是用户暂停」的任务（M1.5 场景 B）。
+	// nil = 打开（IDM/迅雷默认行为）；false = 只在手动点「开始」时才动。
+	AutoResumeOnLaunch *bool `json:"autoResumeOnLaunch,omitempty"`
 	// APIToken is the stable loopback token (generated once, persisted),
 	// so browser extensions keep working across restarts.
 	APIToken string `json:"apiToken"`
+}
+
+// AutoResumeEnabled 报告启动时是否自动续传（缺失配置按开启处理）。
+func (c Config) AutoResumeEnabled() bool {
+	return c.AutoResumeOnLaunch == nil || *c.AutoResumeOnLaunch
 }
 
 // ClipboardEnabled reports whether the clipboard monitor should run.

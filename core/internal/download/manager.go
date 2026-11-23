@@ -40,22 +40,26 @@ type Manager struct {
 
 	mu      sync.Mutex
 	running map[string]runHandle
-	runSeq  uint64
-	dl      *httpx.Downloader
-	hls     *hlsx.Downloader
-	BT      *bttx.Engine
+	// stopReasons 记录「谁让这个任务停的」：用户点的（永不自动续传）还是
+	// 关机/降级（下次启动自动续传）。run() 收尾时取走并写进任务。
+	stopReasons map[string]model.PauseReason
+	runSeq      uint64
+	dl          *httpx.Downloader
+	hls         *hlsx.Downloader
+	BT          *bttx.Engine
 }
 
 func NewManager(st *store.Store, bus *event.Bus, cfg model.Config) *Manager {
 	cl := httpx.NewClient()
 	m := &Manager{
-		Store:   st,
-		Bus:     bus,
-		Client:  cl,
-		Cfg:     cfg,
-		running: map[string]runHandle{},
-		dl:      httpx.NewDownloader(cl, cfg.UserAgent),
-		hls:     hlsx.NewDownloader(cl, cfg.UserAgent),
+		Store:       st,
+		Bus:         bus,
+		Client:      cl,
+		Cfg:         cfg,
+		running:     map[string]runHandle{},
+		stopReasons: map[string]model.PauseReason{},
+		dl:          httpx.NewDownloader(cl, cfg.UserAgent),
+		hls:         hlsx.NewDownloader(cl, cfg.UserAgent),
 	}
 	if cfg.WriteBufferKB > 0 {
 		m.dl.BufferKB = cfg.WriteBufferKB
@@ -217,6 +221,9 @@ func (m *Manager) UpdateConfig(in model.Config) (model.Config, error) {
 	if in.ClipboardWatch != nil {
 		m.Cfg.ClipboardWatch = in.ClipboardWatch
 	}
+	if in.AutoResumeOnLaunch != nil {
+		m.Cfg.AutoResumeOnLaunch = in.AutoResumeOnLaunch
+	}
 	if btChanged := m.applyBTConfig(in); btChanged != nil {
 		// The policy itself is already saved; only the listen-port rebinding
 		// had to wait, so surface that as a hint rather than failing the save.
@@ -372,17 +379,23 @@ func (m *Manager) Create(ctx context.Context, req model.Request) (*model.Task, e
 	}
 	now := time.Now()
 	t := &model.Task{
-		ID:           newID(),
-		Req:          req,
-		Status:       model.StatusReady,
-		Name:         name,
-		SavePath:     savePath,
+		ID:       newID(),
+		Req:      req,
+		Status:   model.StatusReady,
+		Name:     name,
+		SavePath: savePath,
+		// 下载写中间文件，完成后原子改名：半截文件永远不会顶着最终名，
+		// 也永远不会覆盖用户已有的同名文件（§6.1 约束 4）。
+		TempPath:     savePath + model.PartialSuffix,
 		Size:         res.Size,
 		SupportRange: res.SupportRange,
 		Conn:         conn,
 		ProbedURL:    res.ProbedURL,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		// 源文件身份在建任务时就登记一次，续传时才有对照物。
+		Identity:    model.FromProbe(res.Size, res.LastModified, res.ETag),
+		SnapVersion: model.SnapshotVersion,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	if err := m.Store.PutTask(t); err != nil {
 		return nil, err
@@ -423,8 +436,16 @@ func (m *Manager) Start(id string) error {
 // 暂停 on such a row did nothing, so the UI sat at "下载中 · 0 B/s" and the resume
 // button (only rendered for Paused) never appeared — the "任务卡在下载中、点暂停
 // 没反应、只能删除重下（进度全丢）" symptom. Marking it Paused restores 开始/续传.
-func (m *Manager) Stop(id string) {
+func (m *Manager) Stop(id string) { m.stopWith(id, model.PauseUser) }
+
+// stopWith 停止任务并记下「为什么停」。自动续传（M1.5 场景 B）只捞非用户暂停，
+// 所以这个原因是「重启后要不要替你继续下」的唯一依据。
+func (m *Manager) stopWith(id string, reason model.PauseReason) {
 	m.mu.Lock()
+	if m.stopReasons == nil {
+		m.stopReasons = map[string]model.PauseReason{}
+	}
+	m.stopReasons[id] = reason
 	h, running := m.running[id]
 	m.mu.Unlock()
 	if running {
@@ -437,6 +458,7 @@ func (m *Manager) Stop(id string) {
 	}
 	if t.Status == model.StatusRunning || t.Status == model.StatusResolving {
 		t.Status = model.StatusPaused
+		t.PauseReason = reason
 		t.Speed = 0
 		t.UpdatedAt = time.Now()
 		_ = m.Store.PutTask(t)
@@ -455,7 +477,8 @@ func (m *Manager) GracefulShutdown() int {
 	n := 0
 	for _, t := range ts {
 		if t != nil && t.Status == model.StatusRunning {
-			m.Stop(t.ID)
+			// 原因写 shutdown：下次启动自动续传（用户没点暂停，是我们替他停的）。
+			m.stopWith(t.ID, model.PauseShutdown)
 			n++
 		}
 	}
@@ -482,8 +505,35 @@ func (m *Manager) run(ctx context.Context, id string, cancel context.CancelFunc,
 	}
 	t.Status = model.StatusRunning
 	t.Err = ""
+	t.PauseReason = model.PauseNone
+	t.SnapVersion = model.SnapshotVersion
 	_ = m.Store.PutTask(t)
 	m.emitStatus(t)
+
+	// 续传前置校验（R11 / M1.5）：**先证伪再续传**。BT 的真相在 piece 位图、
+	// HLS 的真相在已完成的分片文件里，各由自己的引擎负责，不在这里重复。
+	if !bttx.IsBT(t) && t.HLS == nil {
+		note, err := m.verifyResume(ctx, t)
+		if err != nil {
+			reason := err.Error()
+			t.Status = model.StatusError
+			t.Err = reason
+			t.ResumeNote = reason
+			t.PauseReason = model.PauseInvalid
+			t.Speed = 0
+			t.UpdatedAt = time.Now()
+			_ = m.Store.PutTask(t)
+			m.Bus.Publish(model.Event{Type: "error", TaskID: id, Status: t.Status.String(),
+				Err: reason, Level: "error", TS: time.Now().UnixMilli()})
+			return
+		}
+		if note != "" {
+			_ = m.Store.PutTask(t)
+			m.Bus.Publish(model.Event{Type: "resume", TaskID: id, Status: t.Status.String(),
+				Downloaded: t.Downloaded, Size: t.Size, Err: note, Level: "warn",
+				TS: time.Now().UnixMilli()})
+		}
+	}
 
 	var runErr error
 	if bttx.IsBT(t) {
@@ -594,10 +644,12 @@ func (m *Manager) run(ctx context.Context, id string, cancel context.CancelFunc,
 		t.Chunks = nil
 		t.Downloaded = 0
 		t.Status = model.StatusPaused
+		t.PauseReason = model.PauseDowngrade
 		downgradeRestart = true
 		m.Bus.Publish(model.Event{Type: "downgrade", TaskID: id, Status: t.Status.String(), Size: t.Size, Err: "服务器不支持分块 Range，已自动切换单线程续传", TS: time.Now().UnixMilli()})
 	case runErr != nil && ctx.Err() != nil: // user pause/stop
 		t.Status = model.StatusPaused
+		t.PauseReason = m.takeReason(id)
 	case runErr != nil:
 		t.Status = model.StatusError
 		t.Err = runErr.Error()
@@ -615,6 +667,32 @@ func (m *Manager) run(ctx context.Context, id string, cancel context.CancelFunc,
 	if t.Status == model.StatusComplete && t.Downloaded == 0 && t.Size > 0 {
 		t.Downloaded = t.Size
 	}
+	if t.Status == model.StatusComplete {
+		// 中间文件 → 最终文件（原子改名，目标被占用就加序号，绝不覆盖）。
+		// 改名失败（杀毒正在扫刚写完的文件很常见）重试三次；再失败就保留
+		// 中间文件并把任务标错——字节一个不丢，点「开始」会立刻重试改名。
+		var rnErr error
+		for i, wait := range []time.Duration{0, 400 * time.Millisecond, 1200 * time.Millisecond} {
+			if i > 0 {
+				if !sleepCtx(ctx, wait) {
+					break
+				}
+			}
+			if rnErr = m.finishWorkFile(t); rnErr == nil {
+				break
+			}
+		}
+		if rnErr != nil {
+			t.Status = model.StatusError
+			t.Err = rnErr.Error()
+			t.PauseReason = model.PauseInvalid
+		} else {
+			t.ResumeNote = ""
+			t.PauseReason = model.PauseNone
+		}
+	}
+	t.SnapVersion = model.SnapshotVersion
+	t.UpdatedAt = time.Now()
 	_ = m.Store.PutTask(t)
 	if runErr != nil && ctx.Err() == nil && !isNotRange {
 		m.Bus.Publish(model.Event{Type: "error", TaskID: id, Status: t.Status.String(), Err: runErr.Error(), TS: time.Now().UnixMilli()})

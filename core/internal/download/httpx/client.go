@@ -82,15 +82,20 @@ func Probe(ctx context.Context, c *http.Client, r model.Request, ua string) (*mo
 		// Network/URL failure — surface it (fixes GoPeed's silent-failure class).
 		return nil, fmt.Errorf("probe: %w", err)
 	}
-	defer func() {
+	drainClose := func() {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
-		resp.Body.Close()
-	}()
+		resp.Body.Close() // 第二次调用是幂等的（http 包会返回已关闭错误，忽略）
+	}
+	defer drainClose()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("probe: HTTP %d %s", resp.StatusCode, resp.Status)
 	}
 
 	res := &model.ResolveResult{Name: firstNonEmpty(name, filenameFromResp(resp, r.URL)), Accepts: true}
+	// 续传身份（R11）：ETag / Last-Modified 免费可得，建任务时登记、续传前对照。
+	// 缺失就是空串——不能把「服务器没给」当成「文件变了」。
+	res.LastModified = resp.Header.Get("Last-Modified")
+	res.ETag = resp.Header.Get("ETag")
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent: // 206
@@ -102,11 +107,20 @@ func Probe(ctx context.Context, c *http.Client, r model.Request, ua string) (*mo
 		}
 	default: // 200 — server ignored the probe Range
 		res.Size = resp.ContentLength // -1 if unknown
-		res.SupportRange = strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes")
+		acceptRanges := resp.Header.Get("Accept-Ranges")
+		res.SupportRange = strings.EqualFold(acceptRanges, "bytes")
 		// Many servers (CDN speed endpoints) honor Range without advertising
 		// Accept-Ranges. Confirm with a 2nd probe so we can use N-conn parallel
 		// (this is the reliability fix vs GoPeed's fixed-size splitting).
-		if !res.SupportRange && res.Size > 0 {
+		//
+		// 但服务器**显式**说 Accept-Ranges: none 时不再确认（RFC 7233 §2.3：
+		// none 是权威答复）。对这类服务器确认一次 = 再白下一条全量响应，
+		// 每次续传都付一遍，还会让「单连接回退」在服务器上留下两条并发连接
+		// （M1.5 续传矩阵 E 场景实测：无 Range 服务器峰值 2 条连接）。
+		if !res.SupportRange && res.Size > 0 && !strings.EqualFold(acceptRanges, "none") {
+			// 先释放探针自己的连接再发第二个请求：探针响应还没读完，
+			// 直接确认就等于同时占两条连接。
+			drainClose()
 			res.SupportRange = confirmRange(ctx, c, r, ua)
 		}
 	}

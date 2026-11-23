@@ -21,6 +21,8 @@ var (
 // Store persists config and tasks in a single bbolt file.
 type Store struct {
 	db *bolt.DB
+	// migrations 是本次启动实际执行的快照迁移记录（日志 + UI 提示）。
+	migrations []Migration
 }
 
 // Open opens (creating parents) the bbolt file at path.
@@ -43,7 +45,17 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+
+	// 快照 schema 迁移（M1.5 / R11）：旧版本任务记录在任何人读到它之前先提升
+	// 版本；迁移不自洽一律「保留磁盘文件 + 写人话说明」，绝不静默重下。
+	// 迁移本身失败则拒绝启动并说清下一步——带着坏任务表继续跑，才是把用户
+	// 文件写坏的真正原因。
+	notes, err := (&Store{db: db}).migrate()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("任务库迁移失败（下载文件未被改动，可备份该库文件后重试）：%w", err)
+	}
+	return &Store{db: db, migrations: notes}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

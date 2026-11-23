@@ -350,11 +350,12 @@ func (w *watchdog) start(ctx context.Context, cancel context.CancelFunc, total *
 
 func (w *watchdog) halt() { close(w.stop) }
 
-// Run downloads the task to task.SavePath, streaming progress events via
+// Run downloads the task to its working file (task.WorkPath = TempPath when the
+// manager uses a .suntey-partial intermediate, else SavePath), streaming events via
 // opts.Emit and persisting mid-run progress snapshots via opts.Persist.
 // Mutates task.Chunks / task.Downloaded. Honors ctx cancellation.
 func (d *Downloader) Run(ctx context.Context, task *model.Task, opts *RunOptions) error {
-	f, err := os.OpenFile(task.SavePath, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(task.WorkPath(), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
