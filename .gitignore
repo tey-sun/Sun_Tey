@@ -1,0 +1,71 @@
+# ---- 构建产物 ----
+bin/
+dist/
+build/
+release/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.syso
+
+# ---- 随包二进制（大文件，走 lock 文件或 Git LFS） ----
+packaging/binaries/*
+!packaging/binaries/.gitkeep
+!packaging/binaries.lock.json
+
+# ---- Go ----
+coverage.out
+coverage.html
+*.test
+vendor/
+
+# ---- Node / 前端 ----
+node_modules/
+app/dist/
+.parcel-cache/
+.vite/
+*.log
+npm-debug.log*
+
+# ---- 扩展打包 ----
+extension/dist/
+extension/.plasmo/
+*.zip
+
+# ---- 运行期数据（绝不入库） ----
+data/
+logs/
+cache/
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+.suntey/
+
+# ---- 凭据（绝不入库） ----
+.env
+.env.*
+*token*
+*secret*
+!docs/**/token*.md
+
+# ---- 测试临时物 ----
+tests/tmp/
+tmp/
+*.tmp
+*.partial
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 误写垃圾（历史踩坑，见 KB 04 P2-1） ----
+*Tools Configuration.md
+_smoke*.txt
+_thls*.txt
+_b*.txt
