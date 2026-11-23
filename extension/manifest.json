@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Sun_Tey 下载助手",
+  "version": "0.1.0",
+  "description": "网页视频悬浮下载按钮 + 媒体嗅探，自动带 Referer/Cookie 发送到 Sun_Tey 内核",
+  "permissions": ["storage", "webRequest", "cookies", "tabs", "clipboardRead", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Sun_Tey 设置" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

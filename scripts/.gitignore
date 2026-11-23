@@ -1,0 +1,6 @@
+# 一次性调试探针（可再生），不入库
+dbg.db
+e2e-graceful.db
+probe_*.py
+!probe_rs10.py
+!probe_stop3.py

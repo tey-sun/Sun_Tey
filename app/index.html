@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sun_Tey</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #16181d;
+        --panel: #1f232b;
+        --line: #2c313c;
+        --fg: #e8eaf0;
+        --dim: #9aa2b1;
+        --accent: #3b82f6;
+        --ok: #22c55e;
+        --err: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+      header .logo { font-weight: 700; font-size: 16px; }
+      header .logo b { color: var(--accent); }
+      #status { margin-left: auto; color: var(--dim); font-size: 12px; }
+      main { padding: 16px; }
+      .addbar { display: flex; gap: 8px; margin-bottom: 16px; }
+      .addbar input {
+        flex: 1;
+        padding: 9px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--fg);
+        outline: none;
+      }
+      .addbar input:focus { border-color: var(--accent); }
+      button {
+        padding: 9px 16px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--fg);
+        cursor: pointer;
+      }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .task {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 10px;
+      }
+      .task .row1 { display: flex; align-items: center; gap: 10px; }
+      .task .name { font-weight: 600; }
+      .task .size { color: var(--dim); font-size: 12px; }
+      .task .acts { margin-left: auto; display: flex; gap: 6px; }
+      .task .acts button { padding: 4px 10px; font-size: 12px; }
+      .bar {
+        margin-top: 10px;
+        height: 8px;
+        border-radius: 4px;
+        background: #101318;
+        overflow: hidden;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        transition: width 0.3s;
+      }
+      .task.complete .bar > i { background: var(--ok); }
+      .task.error .bar > i { background: var(--err); }
+      .meta {
+        margin-top: 6px;
+        display: flex;
+        gap: 16px;
+        color: var(--dim);
+        font-size: 12px;
+      }
+      .empty { color: var(--dim); text-align: center; padding: 48px 0; }
+      .badge {
+        font-size: 11px;
+        padding: 1px 8px;
+        border-radius: 999px;
+        background: #101318;
+        color: var(--dim);
+      }
+      .modal {
+        position: fixed; inset: 0;
+        background: rgba(0,0,0,.55);
+        display: flex; align-items: center; justify-content: center;
+        z-index: 50;
+      }
+      .modal[hidden] { display: none; }
+      .modal .card {
+        width: 520px; max-width: 92vw;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 18px 20px;
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      .modal h3 { margin: 0 0 4px; font-size: 16px; }
+      .modal label { font-size: 12px; color: var(--dim); }
+      .modal input, .modal select {
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--fg);
+        outline: none;
+      }
+      .modal input:focus, .modal select:focus { border-color: var(--accent); }
+      .modal .row { display: flex; gap: 8px; align-items: center; }
+      #candlist label { display: flex; gap: 8px; align-items: center; padding: 5px 4px; cursor: pointer; border-radius: 6px; }
+      #candlist label:hover { background: var(--panel); }
+      .modal .row input { flex: 1; }
+      .modal .row.end { justify-content: flex-end; margin-top: 10px; }
+      /* Live log line: level-coloured. A 1st/2nd quick chunk retry is normal
+         noise (grey), a repeated failure is worth attention (yellow), and only
+         a real give-up is red — the old UI painted every retry red, which read
+         as "下载一直循环" even while bytes were moving. */
+      .msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .msg.info { color: var(--dim); }
+      .msg.warn { color: #eab308; }
+      .msg.err { color: var(--err); }
+      .task .bt { color: #7dd3fc; font-size: 11px; }
+      .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+      .settings-grid .full { grid-column: 1 / -1; }
+      .sw { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg); }
+      .sw input { width: 15px; height: 15px; accent-color: var(--accent); }
+      .card { max-height: 86vh; overflow: auto; }
+      .card h4 { margin: 14px 0 6px; font-size: 13px; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+      .hint { font-size: 12px; color: var(--dim); }
+      .steps { font-size: 12px; color: var(--dim); margin: 4px 0 0; padding-left: 18px; }
+      .steps li { margin: 2px 0; }
+      .steps code { background: #101318; padding: 1px 5px; border-radius: 4px; color: #cbd5e1; }
+      .extpath { font-size: 11px; color: var(--dim); word-break: break-all; background: #101318; padding: 6px 8px; border-radius: 6px; }
+      .tabs { display: flex; gap: 4px; margin-bottom: 12px; align-items: center; }
+      .tabs button { padding: 6px 14px; font-size: 13px; border-radius: 7px; }
+      .tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+      .tabs .spacer { flex: 1; }
+      .tabs select { font-size: 13px; padding: 5px 8px; border-radius: 7px; background: transparent; color: var(--fg); border: 1px solid var(--line); }
+      .tabs select option { background: var(--panel); color: var(--fg); }
+    </style>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <header>
+      <span class="logo">Fast<b>DL</b></span>
+      <span class="badge" id="core-badge">core: …</span>
+      <span id="status"></span>
+    </header>
+    <main>
+      <form class="addbar" id="addform">
+        <input id="url" placeholder="粘贴下载链接（HTTP/HTTPS）、m3u8 视频、磁力链接 magnet:… 或 .torrent 路径" spellcheck="false" />
+        <button class="primary" id="addbtn" type="submit">下载</button>
+        <button id="torrentbtn" type="button" title="选择本地 .torrent 种子文件">种子…</button>
+        <button id="gearbtn" type="button" title="设置">⚙</button>
+      </form>
+      <div class="tabs">
+        <button type="button" id="tab-all" class="on">全部</button>
+        <button type="button" id="tab-run">下载中</button>
+        <button type="button" id="tab-done">已完成</button>
+        <span class="spacer"></span>
+        <select id="sortsel" title="任务排序">
+          <option value="new">最新优先</option>
+          <option value="fast">速度优先</option>
+          <option value="size">大小优先</option>
+          <option value="name">按名称</option>
+        </select>
+      </div>
+      <div id="tasks"><div class="empty">暂无任务</div></div>
+
+      <div id="settings" class="modal" hidden>
+        <div class="card">
+          <h3>设置</h3>
+          <div class="full hint" id="ver-line">内核版本：读取中…</div>
+          <label>默认下载目录</label>
+          <div class="row">
+            <input id="cfg-dir" spellcheck="false" />
+            <button id="cfg-browse" type="button">浏览…</button>
+          </div>
+          <h4>下载内核</h4>
+          <div class="settings-grid">
+            <div>
+              <label>默认线程数（分片并发）</label>
+              <select id="cfg-conn">
+                <option>1</option><option>2</option><option>4</option>
+                <option>8</option><option>16</option><option>32</option>
+              </select>
+            </div>
+            <div>
+              <label>最大并发任务数（0 = 不限）</label>
+              <input id="cfg-max" type="number" min="0" max="64" />
+            </div>
+            <div>
+              <label>写缓冲大小（KB，越大越省磁盘 IOPS）</label>
+              <input id="cfg-buf" type="number" min="16" max="16384" step="16" />
+            </div>
+            <div>
+              <label>限速（KB/s，0 = 不限速）</label>
+              <input id="cfg-rate" type="number" min="0" max="1048576" step="16" />
+            </div>
+            <div class="full">
+              <label class="sw"><input id="cfg-clip" type="checkbox" /> 剪贴板监听（复制磁力 / 常见文件链接时自动下载）</label>
+            </div>
+            <div class="full">
+              <label>User-Agent（下载与探活请求头）</label>
+              <input id="cfg-ua" spellcheck="false" />
+            </div>
+          </div>
+          <h4>BT / 磁力下载</h4>
+          <div class="settings-grid">
+            <div>
+              <label>BT 监听端口（0 = 随机）</label>
+              <input id="cfg-btport" type="number" min="0" max="65535" />
+            </div>
+            <div class="full hint" id="bt-stats">BT 状态：加载中…</div>
+            <label class="sw"><input id="cfg-btseed" type="checkbox" /> 下载完成后继续做种</label>
+            <label class="sw"><input id="cfg-btnoup" type="checkbox" /> 只下载不上传（纯下载模式）</label>
+            <div class="full hint">改端口后需暂停所有 BT 任务再保存才生效；连不上时优先检查端口是否被路由器拦截。</div>
+          </div>
+          <h4>浏览器扩展（网页视频 / 右键下载）</h4>
+          <div class="extpath" id="ext-path">…</div>
+          <div class="row" style="margin-top:8px">
+            <button id="ext-open" type="button">打开扩展文件夹</button>
+            <button id="ext-copy" type="button">复制路径</button>
+            <button id="ext-cfg" type="button">复制端口+令牌</button>
+          </div>
+          <ol class="steps">
+            <li>Chrome/Edge 地址栏打开 <code>chrome://extensions</code>（Edge 用 <code>edge://extensions</code>）</li>
+            <li>打开右侧 <code>开发者模式</code> 开关</li>
+            <li>点 <code>加载已解压的扩展程序</code>，选中上面那个文件夹</li>
+            <li>扩展图标里粘贴「端口+令牌」完成连接</li>
+          </ol>
+          <div class="row end">
+            <button id="cfg-cancel" type="button">取消</button>
+            <button id="cfg-save" class="primary" type="button">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="candmodal" class="modal" hidden>
+        <div class="card">
+          <h3>选择要下载的文件</h3>
+          <div class="full hint" id="candpage"></div>
+          <div id="candlist" style="margin:10px 0"></div>
+          <div class="row end">
+            <button id="cand-cancel" type="button">取消</button>
+            <button id="cand-ok" class="primary" type="button">下载</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="filemodal" class="modal" hidden>
+        <div class="card">
+          <h3>文件选择</h3>
+          <div class="full hint" id="filehint"></div>
+          <div id="filelist" style="margin:10px 0"></div>
+          <div class="row end">
+            <button id="file-cancel" type="button">取消</button>
+            <button id="file-ok" class="primary" type="button">应用</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

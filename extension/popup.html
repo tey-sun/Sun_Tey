@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 14px;
+        background: #1a1b1e;
+        color: #e9e9ea;
+        font: 13px/1.6 system-ui, sans-serif;
+      }
+      b { font-size: 14px; }
+      .hint { color: #868e96; font-size: 12px; margin: 6px 0; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        background: #242528;
+        color: #e9e9ea;
+        border: 1px solid #2c2e33;
+        border-radius: 6px;
+        padding: 7px 9px;
+        margin: 6px 0;
+      }
+      .row { display: flex; gap: 8px; margin-top: 8px; }
+      button {
+        flex: 1;
+        background: #e8590c;
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        padding: 7px 0;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.ghost { background: #2c2e33; }
+      #msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+      .ok { color: #2b8a3e; }
+      .err { color: #e03131; }
+      .warn { color: #e8590c; }
+      .guide {
+        margin-top: 14px;
+        border-top: 1px solid #2c2e33;
+        padding-top: 10px;
+        font-size: 12px;
+      }
+      .guide ol { margin: 6px 0; padding-left: 20px; color: #adb5bd; }
+      .guide li { margin: 4px 0; }
+      code { background: #242528; padding: 1px 4px; border-radius: 4px; }
+      button.small {
+        flex: none;
+        display: block;
+        width: 100%;
+        margin-top: 8px;
+        padding: 6px 0;
+        font-size: 12px;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <b>Sun_Tey 连接设置</b>
+    <div class="hint">
+      在 Sun_Tey 桌面窗口点击左上角橙色 core 徽标复制「端口|令牌」，粘贴到下面。
+    </div>
+    <input id="conn" placeholder="17332|3d033f30…" />
+    <div class="row">
+      <button id="save">保存并测试</button>
+      <button id="paste" class="ghost">粘贴</button>
+    </div>
+    <div id="msg"></div>
+    <div class="guide">
+      <b>安装本扩展</b>
+      <ol>
+        <li>地址栏打开 <code>chrome://extensions</code></li>
+        <li>开启右上角「开发者模式」</li>
+        <li>点「加载已解压的扩展程序」</li>
+        <li>选择 ext 文件夹（路径见下按钮，需自行打开该文件夹）</li>
+      </ol>
+      <button id="extpath" class="ghost small">复制扩展路径</button>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

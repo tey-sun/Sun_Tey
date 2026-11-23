@@ -1,0 +1,64 @@
+name: CI
+
+# 施工图 §M0-5 / 规则要求 §48：vet + test(-short[-race]) + build 是硬门禁，不许放宽。
+# Linux 跑 -race（自带 gcc，Windows 侧本机没有 cgo 工具链），Windows 跑目标平台真实行为。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core-linux:
+    name: core / linux (vet + race tests + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: core/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -short -race
+        run: go test -short -race ./... -count=1 -timeout 30m
+      - name: go build
+        run: go build ./...
+
+  core-windows:
+    name: core / windows (target platform)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: core/go.sum
+      - name: gofmt clean tree
+        shell: pwsh
+        run: |
+          $dirty = gofmt -l .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($dirty) {
+            $dirty
+            Write-Host "上面这些文件没有 gofmt，请先 gofmt -w ."
+            exit 1
+          }
+      - name: go vet
+        run: go vet ./...
+      - name: go test -short
+        run: go test -short ./... -count=1 -timeout 30m
+      - name: go build
+        run: go build ./...
